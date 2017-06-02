@@ -16,4 +16,4 @@ build:
           cabal build && cabal test --show-details=always
 
     post_ci:
-        - ~/.cabal/bin/hcp-coveralls --display-report tests
+        - ~/.cabal/bin/hpc-coveralls --display-report tests
