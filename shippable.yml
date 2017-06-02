@@ -10,7 +10,7 @@ build:
     ci:
         - dnf -y install libcurl-devel
         - cabal install hlint hpc-coveralls
-        - cd importer && ~/.cabal/bin/hlint .
+        - cd importer && ~/.cabal/bin/hlint . && cd ../
         - cd importer && cabal install --dependencies-only --enable-tests &&
           cabal configure --enable-tests --enable-coverage &&
           cabal build && cabal test --show-details=always
