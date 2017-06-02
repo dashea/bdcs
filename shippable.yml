@@ -1,0 +1,18 @@
+language: none
+build:
+    pre_ci:
+        - docker build -t weldr/bdcs-build-img -f Dockerfile.build .
+
+    pre_ci_boot:
+        image_name: weldr/bdcs-build-img
+        image_tag: latest
+
+    ci:
+        - cabal install hlint hpc-coveralls
+        - cd importer && ~/.cabal/bin/hlint .
+        - cd importer && cabal install --dependencies-only --enable-tests &&
+          cabal configure --enable-tests --enable-coverage &&
+          cabal build && cabal test --show-details=always
+
+    post_ci:
+        - ~/.cabal/bin/hcp-coveralls --display-report tests
