@@ -8,6 +8,7 @@ build:
         image_tag: latest
 
     ci:
+        - dnf -y install libcurl-devel
         - cabal install hlint hpc-coveralls
         - cd importer && ~/.cabal/bin/hlint .
         - cd importer && cabal install --dependencies-only --enable-tests &&
