@@ -8,12 +8,13 @@ build:
         image_tag: latest
 
     ci:
+        - mkdir -p shippable/testresults
         - dnf -y install libcurl-devel
         - cabal install hlint hpc-coveralls
         - cd importer && ~/.cabal/bin/hlint . && cd ../
         - cd importer && cabal install --dependencies-only --enable-tests &&
-          cabal configure --enable-tests --enable-library-coverage --enable-coverage &&
-          cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=junit.xml
+          cabal configure --enable-tests --enable-coverage &&
+          cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=../shippable/testresults/results.xml
 
     post_ci:
         - ~/.cabal/bin/hpc-coveralls --display-report test-db
