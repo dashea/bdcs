@@ -17,7 +17,7 @@ build:
           cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=../shippable/testresults/results.xml
 
     post_ci:
-        - ~/.cabal/bin/hpc-coveralls --display-report test-db --repo-token=${COVERALLS_BDCS_REPO_TOKEN}
+        - ~/.cabal/bin/hpc-coveralls test-db --repo-token=${COVERALLS_BDCS_REPO_TOKEN} --service-name=""
 
 integrations:
     generic:
