@@ -18,3 +18,7 @@ build:
 
     post_ci:
         - ~/.cabal/bin/hpc-coveralls --display-report test-db --repo-token=${COVERALLS_BDCS_REPO_TOKEN}
+
+integrations:
+    generic:
+        name: coveralls-repo-token
