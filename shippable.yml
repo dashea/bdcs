@@ -12,7 +12,7 @@ build:
         - cabal install hlint hpc-coveralls
         - cd importer && ~/.cabal/bin/hlint . && cd ../
         - cd importer && cabal install --dependencies-only --enable-tests &&
-          cabal configure --enable-tests --enable-library-coverage &&
+          cabal configure --enable-tests --enable-library-coverage --enable-coverage &&
           cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=junit.xml
 
     post_ci:
