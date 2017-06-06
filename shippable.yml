@@ -13,7 +13,7 @@ build:
         - cd importer && ~/.cabal/bin/hlint . && cd ../
         - cd importer && cabal install --dependencies-only --enable-tests &&
           cabal configure --enable-tests --enable-library-coverage &&
-          cabal build && cabal test --show-details=always
+          cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=junit.xml
 
     post_ci:
         - ~/.cabal/bin/hpc-coveralls --display-report tests
