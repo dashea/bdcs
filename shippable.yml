@@ -16,4 +16,4 @@ build:
           cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=junit.xml
 
     post_ci:
-        - ~/.cabal/bin/hpc-coveralls --display-report tests
+        - ~/.cabal/bin/hpc-coveralls --display-report test-db
