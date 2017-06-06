@@ -17,7 +17,9 @@
 
 module Main where
 
-import Test.Tasty(defaultMain, testGroup)
+import Test.Tasty(testGroup)
+import Test.Tasty.Runners(defaultMainWithIngredients)
+import Test.Tasty.Runners.AntXML(antXMLRunner)
 
 import qualified BDCS.RPM.Builds.Tests
 import qualified BDCS.RPM.Projects.Tests
@@ -27,7 +29,7 @@ import qualified BDCS.RPM.Sources.Tests
 {-# ANN module "HLint: ignore Use module export list" #-}
 
 main :: IO ()
-main = defaultMain $ testGroup "BDCS.RPM Tests" [
+main = defaultMainWithIngredients [antXMLRunner] $ testGroup "BDCS.RPM Tests" [
     BDCS.RPM.Builds.Tests.tests,
     BDCS.RPM.Projects.Tests.tests,
     BDCS.RPM.Signatures.Tests.tests,

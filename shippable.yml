@@ -1,0 +1,24 @@
+language: none
+build:
+    pre_ci:
+        - docker build -t weldr/bdcs-build-img -f Dockerfile.build .
+
+    pre_ci_boot:
+        image_name: weldr/bdcs-build-img
+        image_tag: latest
+
+    ci:
+        - mkdir -p shippable/testresults
+        - dnf -y install libcurl-devel
+        - cabal install hlint hpc-coveralls
+        - cd importer && ~/.cabal/bin/hlint . && cd ../
+        - cd importer && cabal install --dependencies-only --enable-tests &&
+          cabal configure --enable-tests --enable-coverage &&
+          cabal build && cabal test --show-details=always --keep-tix-files --test-option=--xml=../shippable/testresults/results.xml
+
+    post_ci:
+        - ~/.cabal/bin/hpc-coveralls test-db --repo-token=${COVERALLS_BDCS_REPO_TOKEN} --service-name=""
+
+integrations:
+    generic:
+        - integrationName: coveralls-repo-token

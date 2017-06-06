@@ -153,6 +153,7 @@ Test-Suite test-db
                        persistent,
                        persistent-sqlite,
                        tasty,
+                       tasty-ant-xml,
                        tasty-hunit,
                        db,
                        rpm >= 1
