@@ -21,4 +21,4 @@ build:
 
 integrations:
     generic:
-        name: coveralls-repo-token
+        - integrationName: coveralls-repo-token
