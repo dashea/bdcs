@@ -124,8 +124,10 @@ executable export
                        mtl >= 2.2.1,
                        persistent,
                        persistent-sqlite,
+                       process,
                        resourcet,
                        tar,
+                       temporary,
                        text,
                        time,
                        unix

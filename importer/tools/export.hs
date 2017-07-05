@@ -21,7 +21,7 @@
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as Tar
-import           Control.Conditional(ifM, whenM)
+import           Control.Conditional(cond, ifM, whenM)
 import           Control.Monad(unless, when)
 import           Control.Monad.Except(ExceptT(..), MonadError, runExceptT, throwError)
 import           Control.Monad.IO.Class(MonadIO, liftIO)
@@ -29,7 +29,7 @@ import           Control.Monad.Trans(lift)
 import           Control.Monad.Trans.Resource(MonadBaseControl, MonadResource, runResourceT)
 import           Data.ByteString(ByteString)
 import           Data.ByteString.Lazy(writeFile)
-import           Data.Conduit((.|), Conduit, Consumer, Producer, await, runConduit, yield)
+import           Data.Conduit((.|), Conduit, Consumer, Producer, await, bracketP, runConduit, yield)
 import           Data.Conduit.Binary(sinkFile, sinkLbs)
 import qualified Data.Conduit.List as CL
 import           Data.List(isSuffixOf, isPrefixOf, partition)
@@ -39,12 +39,14 @@ import           Data.Time.Clock.POSIX(posixSecondsToUTCTime)
 import           Database.Persist.Sql(SqlPersistT)
 import           Database.Persist.Sqlite(runSqlite)
 import           Prelude hiding(writeFile)
-import           System.Directory(createDirectoryIfMissing, doesFileExist, removeFile, setModificationTime)
+import           System.Directory(createDirectoryIfMissing, doesFileExist, removeFile, removePathForcibly, setModificationTime)
 import           System.Environment(getArgs)
 import           System.Exit(exitFailure)
 import           System.FilePath((</>), dropDrive, takeDirectory)
+import           System.IO.Temp(createTempDirectory)
 import           System.Posix.Files(createSymbolicLink, setFileMode)
 import           System.Posix.Types(CMode(..))
+import           System.Process(callProcess)
 
 import           GI.Gio(IsInputStream, inputStreamReadBytes, noCancellable)
 import           GI.GLib(bytesGetData, bytesGetSize)
@@ -180,6 +182,22 @@ directorySink outPath = await >>= \case
 
         -- TODO user, group, xattrs
 
+qcow2Sink :: (MonadResource m, MonadIO m) => FilePath -> Consumer (Files, CS.Object) m ()
+qcow2Sink outPath =
+    -- Writing and importing a tar file probably will not work, because some rpms contain paths
+    -- with symlinks (e.g., /lib64/libaudit.so.1 is expected to be written to /usr/lib64).
+    -- Instead, export to a temp directory and convert that to qcow
+
+    bracketP (createTempDirectory (takeDirectory outPath) "export")
+        removePathForcibly
+        (\tmpDir -> do
+            -- Run the sink to create a directory export
+            directorySink tmpDir
+
+            -- Run virt-make-fs to generate the qcow2
+            liftIO $ callProcess "virt-make-fs" [tmpDir, outPath, "--format=qcow2", "--label=composer"]
+        )
+
 -- | Check a list of strings to see if any of them are files
 -- If it is, read it and insert its contents in its place
 expandFileThings :: [String] -> IO [String]
@@ -225,9 +243,9 @@ main = do
     when (length match < 1) needFilesystem
     let things = map T.pack $ match !! 0 : otherThings
 
-    let (handler, objectSink) = if ".tar" `isSuffixOf` out_path
-            then (\e -> print e >> whenM (doesFileExist out_path) (removeFile out_path), objectToTarEntry .| tarSink out_path)
-            else (print, directorySink out_path)
+    let (handler, objectSink) = cond [(".tar" `isSuffixOf` out_path,   (cleanupHandler out_path, objectToTarEntry .| tarSink out_path)),
+                                      (".qcow2" `isSuffixOf` out_path, (cleanupHandler out_path, qcow2Sink out_path)),
+                                      (otherwise,                      (print, directorySink out_path))]
 
     result <- runExceptT $ runSqlite db_path $ runConduit $ CL.sourceList things
         .| getGroupIdC
@@ -236,3 +254,7 @@ main = do
         .| objectSink
 
     whenLeft result handler
+ where
+    cleanupHandler :: Show a => FilePath -> a -> IO ()
+    cleanupHandler path e = print e >>
+        whenM (doesFileExist path) (removeFile path)
