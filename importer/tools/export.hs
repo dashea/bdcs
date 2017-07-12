@@ -28,18 +28,18 @@ import           Control.Monad.IO.Class(MonadIO, liftIO)
 import           Control.Monad.Trans(lift)
 import           Control.Monad.Trans.Resource(MonadBaseControl, MonadResource, runResourceT)
 import           Data.ByteString(ByteString)
-import           Data.ByteString.Lazy(writeFile)
+import qualified Data.ByteString.Lazy as BSL
 import           Data.Conduit((.|), Conduit, Consumer, Producer, await, bracketP, runConduit, yield)
 import           Data.Conduit.Binary(sinkFile, sinkLbs)
 import qualified Data.Conduit.List as CL
-import           Data.List(isSuffixOf, isPrefixOf, partition)
+import           Data.List(intercalate, isSuffixOf, isPrefixOf, partition)
+import           Data.List.Split(splitOn)
 import           Data.Maybe(fromMaybe)
 import qualified Data.Text as T
 import           Data.Time.Clock.POSIX(posixSecondsToUTCTime)
 import           Database.Persist.Sql(SqlPersistT)
 import           Database.Persist.Sqlite(runSqlite)
-import           Prelude hiding(writeFile)
-import           System.Directory(createDirectoryIfMissing, doesFileExist, removeFile, removePathForcibly, setModificationTime)
+import           System.Directory(createDirectoryIfMissing, doesFileExist, removeFile, removePathForcibly, renameFile, setModificationTime)
 import           System.Environment(getArgs)
 import           System.Exit(exitFailure)
 import           System.FilePath((</>), dropDrive, takeDirectory)
@@ -60,6 +60,8 @@ import           BDCS.RPM.Utils(splitFilename)
 import           BDCS.Version
 import           Utils.Either(maybeToEither, whenLeft)
 import           Utils.Monad(concatMapM)
+
+import           Paths_db(getDataFileName)
 
 -- Convert a GInputStream to a conduit source
 sourceInputStream :: (MonadResource m, IsInputStream i) => i -> Producer m ByteString
@@ -140,7 +142,7 @@ objectToTarEntry = await >>= \case
 tarSink :: MonadIO m => FilePath -> Consumer Tar.Entry m ()
 tarSink out_path = do
     entries <- CL.consume
-    liftIO $ writeFile out_path (Tar.write entries)
+    liftIO $ BSL.writeFile out_path (Tar.write entries)
 
 directorySink :: MonadIO m => FilePath -> Consumer (Files, CS.Object) m ()
 directorySink outPath = await >>= \case
@@ -194,9 +196,37 @@ qcow2Sink outPath =
             -- Run the sink to create a directory export
             directorySink tmpDir
 
+            -- Make the directory export something usable, hopefully
+            liftIO $ runHacks tmpDir
+
             -- Run virt-make-fs to generate the qcow2
             liftIO $ callProcess "virt-make-fs" [tmpDir, outPath, "--format=qcow2", "--label=composer"]
         )
+
+ where
+    runHacks :: FilePath -> IO ()
+    runHacks exportPath = do
+        -- set a root password
+        -- pre-crypted from "redhat"
+        shadowRecs <- map (splitOn ":") <$> lines <$> readFile (exportPath </> "etc" </> "shadow")
+        let newRecs = map (\rec -> if head rec == "root" then
+                                    ["root", "$6$3VLMX3dyCGRa.JX3$RpveyimtrKjqcbZNTanUkjauuTRwqAVzRK8GZFkEinbjzklo7Yj9Z6FqXNlyajpgCdsLf4FEQQKH6tTza35xs/"] ++ drop 2 rec
+                                   else
+                                    rec) shadowRecs
+        writeFile (exportPath </> "etc" </> "shadow.new") (unlines $ map (intercalate ":") newRecs)
+        renameFile (exportPath </> "etc" </> "shadow.new") (exportPath </> "etc" </> "shadow")
+
+        -- create an empty machine-id
+        writeFile (exportPath </> "etc" </> "machine-id") ""
+
+        -- Install a sysusers.d config file, and run systemd-sysusers to implement it
+        let sysusersDir = exportPath </> "usr" </> "lib" </> "sysusers.d"
+        createDirectoryIfMissing True sysusersDir
+        getDataFileName "sysusers-default.conf" >>= readFile >>= writeFile (sysusersDir </> "weldr.conf")
+        callProcess "systemd-sysusers" ["--root", exportPath]
+
+        -- Create a fstab stub
+        writeFile (exportPath </> "etc" </> "fstab") "LABEL=composer / ext2 defaults 0 0"
 
 -- | Check a list of strings to see if any of them are files
 -- If it is, read it and insert its contents in its place
