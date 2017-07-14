@@ -21,7 +21,7 @@
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as Tar
-import           Control.Conditional(cond, ifM, whenM)
+import           Control.Conditional(cond, ifM, whenM, unlessM)
 import           Control.Monad(unless, when)
 import           Control.Monad.Except(ExceptT(..), MonadError, runExceptT, throwError)
 import           Control.Monad.IO.Class(MonadIO, liftIO)
@@ -39,7 +39,7 @@ import qualified Data.Text as T
 import           Data.Time.Clock.POSIX(posixSecondsToUTCTime)
 import           Database.Persist.Sql(SqlPersistT)
 import           Database.Persist.Sqlite(runSqlite)
-import           System.Directory(createDirectoryIfMissing, doesFileExist, removeFile, removePathForcibly, renameFile, setModificationTime)
+import           System.Directory(createDirectoryIfMissing, doesFileExist, doesPathExist, removeFile, removePathForcibly, renameFile, setModificationTime)
 import           System.Environment(getArgs)
 import           System.Exit(exitFailure)
 import           System.FilePath((</>), dropDrive, takeDirectory)
@@ -166,8 +166,9 @@ directorySink outPath = await >>= \case
         createDirectoryIfMissing True $ takeDirectory fullPath
 
         -- Write the data or the symlink, depending
+        -- Skip creating the symbolic link if the target already exists
         case (symlink, contents) of
-            (Just symlinkTarget, _) -> createSymbolicLink (T.unpack symlinkTarget) fullPath
+            (Just symlinkTarget, _) -> unlessM (doesPathExist fullPath) (createSymbolicLink (T.unpack symlinkTarget) fullPath)
             (_, Just c)             -> do
                 runResourceT $ runConduit $ sourceInputStream c .| sinkFile fullPath
                 setMetadata f fullPath metadata
@@ -203,30 +204,30 @@ qcow2Sink outPath =
             liftIO $ callProcess "virt-make-fs" [tmpDir, outPath, "--format=qcow2", "--label=composer"]
         )
 
- where
-    runHacks :: FilePath -> IO ()
-    runHacks exportPath = do
-        -- set a root password
-        -- pre-crypted from "redhat"
-        shadowRecs <- map (splitOn ":") <$> lines <$> readFile (exportPath </> "etc" </> "shadow")
-        let newRecs = map (\rec -> if head rec == "root" then
-                                    ["root", "$6$3VLMX3dyCGRa.JX3$RpveyimtrKjqcbZNTanUkjauuTRwqAVzRK8GZFkEinbjzklo7Yj9Z6FqXNlyajpgCdsLf4FEQQKH6tTza35xs/"] ++ drop 2 rec
-                                   else
-                                    rec) shadowRecs
-        writeFile (exportPath </> "etc" </> "shadow.new") (unlines $ map (intercalate ":") newRecs)
-        renameFile (exportPath </> "etc" </> "shadow.new") (exportPath </> "etc" </> "shadow")
+-- | Run filesystem hacks needed to make a directory tree bootable
+runHacks :: FilePath -> IO ()
+runHacks exportPath = do
+    -- set a root password
+    -- pre-crypted from "redhat"
+    shadowRecs <- map (splitOn ":") <$> lines <$> readFile (exportPath </> "etc" </> "shadow")
+    let newRecs = map (\rec -> if head rec == "root" then
+                                ["root", "$6$3VLMX3dyCGRa.JX3$RpveyimtrKjqcbZNTanUkjauuTRwqAVzRK8GZFkEinbjzklo7Yj9Z6FqXNlyajpgCdsLf4FEQQKH6tTza35xs/"] ++ drop 2 rec
+                               else
+                                rec) shadowRecs
+    writeFile (exportPath </> "etc" </> "shadow.new") (unlines $ map (intercalate ":") newRecs)
+    renameFile (exportPath </> "etc" </> "shadow.new") (exportPath </> "etc" </> "shadow")
 
-        -- create an empty machine-id
-        writeFile (exportPath </> "etc" </> "machine-id") ""
+    -- create an empty machine-id
+    writeFile (exportPath </> "etc" </> "machine-id") ""
 
-        -- Install a sysusers.d config file, and run systemd-sysusers to implement it
-        let sysusersDir = exportPath </> "usr" </> "lib" </> "sysusers.d"
-        createDirectoryIfMissing True sysusersDir
-        getDataFileName "sysusers-default.conf" >>= readFile >>= writeFile (sysusersDir </> "weldr.conf")
-        callProcess "systemd-sysusers" ["--root", exportPath]
+    -- Install a sysusers.d config file, and run systemd-sysusers to implement it
+    let sysusersDir = exportPath </> "usr" </> "lib" </> "sysusers.d"
+    createDirectoryIfMissing True sysusersDir
+    getDataFileName "sysusers-default.conf" >>= readFile >>= writeFile (sysusersDir </> "weldr.conf")
+    callProcess "systemd-sysusers" ["--root", exportPath]
 
-        -- Create a fstab stub
-        writeFile (exportPath </> "etc" </> "fstab") "LABEL=composer / ext2 defaults 0 0"
+    -- Create a fstab stub
+    writeFile (exportPath </> "etc" </> "fstab") "LABEL=composer / ext2 defaults 0 0"
 
 -- | Check a list of strings to see if any of them are files
 -- If it is, read it and insert its contents in its place
@@ -275,7 +276,7 @@ main = do
 
     let (handler, objectSink) = cond [(".tar" `isSuffixOf` out_path,   (cleanupHandler out_path, objectToTarEntry .| tarSink out_path)),
                                       (".qcow2" `isSuffixOf` out_path, (cleanupHandler out_path, qcow2Sink out_path)),
-                                      (otherwise,                      (print, directorySink out_path))]
+                                      (otherwise,                      (print, directoryOutput out_path))]
 
     result <- runExceptT $ runSqlite db_path $ runConduit $ CL.sourceList things
         .| getGroupIdC
@@ -285,6 +286,11 @@ main = do
 
     whenLeft result handler
  where
+    directoryOutput :: MonadIO m => FilePath -> Consumer (Files, CS.Object) m ()
+    directoryOutput path = do
+        directorySink path
+        liftIO $ runHacks path
+
     cleanupHandler :: Show a => FilePath -> a -> IO ()
     cleanupHandler path e = print e >>
         whenM (doesFileExist path) (removeFile path)
