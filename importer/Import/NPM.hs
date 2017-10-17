@@ -73,6 +73,11 @@ import Import.State(ImportState(..))
 import Utils.Either(whenLeft)
 import Utils.Monad((>>?))
 
+-- what version of a package to import
+data PackageVersion = Latest
+                    | Range SemVerRangeSet
+ deriving(Show)
+
 -- base URI for the package.json information
 npmRegistry :: URI
 npmRegistry = URI {uriScheme    = "https:",
@@ -98,6 +103,19 @@ instance FromJSON PackageDist where
                                            <*> d .:? "shasum"
                                            <*> d .:  "tarball"
             Just _          -> fail "Dist not an object"
+
+-- This is a type for the data returned by registry.npmjs.org/<name>.
+-- The data here constists of a "versions" object, which is a map of version number -> PackageDist
+-- Like above, the dist information is the only actually useful part of the data for each version,
+-- so it's all we keep.
+newtype PackageVersionList = PackageVersionList [(T.Text, PackageDist)]
+
+instance FromJSON PackageVersionList where
+    parseJSON = withObject "registry JSON" $ \v ->
+        case HM.lookup "versions" v of
+            Nothing          -> fail "Missing versions object"
+            Just (Object vs) -> PackageVersionList <$> mapM (\(ver, obj) -> (ver,) <$> parseJSON obj) (HM.toList vs)
+            Just _           -> fail "versions not an object"
 
 -- the parts of package.json we care about
 data PackageJSON = PackageJSON {
@@ -179,11 +197,158 @@ instance FromJSON PackageJSON where
             f :: T.Text -> Value -> Parser [(T.Text, T.Text)] -> Parser [(T.Text, T.Text)]
             f key v acc = withText "String" (\s -> ((key, s):) <$> acc) v
 
-readRegistryJSON :: (MonadError String m, MonadBaseControl IO m, MonadThrow m, MonadIO m) => String -> m PackageDist
-readRegistryJSON pkgname = do
+readRegistryJSON :: (MonadError String m, MonadBaseControl IO m, MonadThrow m, MonadIO m) => String -> PackageVersion -> m [PackageDist]
+readRegistryJSON pkgname Latest = do
     let uri = relativeTo (nullURI {uriPath = pkgname ++ "/latest"}) npmRegistry
     jsonData <- runConduitRes $ getFromURI uri .| sinkLbs
-    either throwError return $ eitherDecode jsonData
+    either throwError (return . (:[])) $ eitherDecode jsonData
+
+readRegistryJSON pkgname (Range range) = do
+    let uri = relativeTo (nullURI {uriPath = pkgname}) npmRegistry
+
+    -- Fetch the list of all available versions
+    jsonData <- runConduitRes $ getFromURI uri .| sinkLbs
+
+    -- Pull the available versions out as a list and parse into SemVers
+    versionList <- ptol <$> either throwError return (eitherDecode jsonData)
+    parsedVersionList <- mapM parseVersionList versionList
+
+    -- Return the versions that match the given range
+    return $ map snd $ filter (\(ver, _) -> ver `satisfies` range) parsedVersionList
+ where
+    ptol :: PackageVersionList -> [(T.Text, PackageDist)]
+    ptol (PackageVersionList v) = v
+
+    parseVersionList :: MonadError String m => (T.Text, PackageDist) -> m (SemVer, PackageDist)
+    parseVersionList (v, d) = do
+        parsedVersion <- either (throwError . show) return $ parseSemVer v
+        return (parsedVersion, d)
+
+importPackage :: (MonadError String m, MonadResource m, MonadBaseControl IO m) => ContentStore -> String -> PackageVersion -> SqlPersistT m ()
+importPackage repo name version = do
+    liftIO $ print $ "Importing " ++ name ++ "@" ++ show version
+    jsons <- readRegistryJSON name version
+    when (null jsons) $ throwError $ "Unable to find version " ++ show version ++ " of " ++ name
+
+    mapM_ (importJSON repo) jsons
+
+importJSON :: (MonadError String m, MonadResource m, MonadBaseControl IO m) => ContentStore -> PackageDist -> SqlPersistT m ()
+importJSON repo distJson = do
+    -- Get the URI to the tarball out of the JSON
+    let distTarball = T.unpack $ tarball distJson
+    distURI <- maybe (throwError $ "Error parsing dist URI: " ++ distTarball) return $ parseURI distTarball
+
+    -- conduits for consuming the tar entries:
+    -- this one loads the content into the content store and returns a list of (uninserted) Files records
+    let pathPipe = tarEntryToFile repo .| CL.consume
+    -- this one returns the parsed package.json
+    let jsonPipe = parsePackageJson
+
+    -- Zip them together into a sink returning a tuple
+    let tarSink = getZipConduit ((,) <$> ZipConduit pathPipe
+                                     <*> ZipConduit jsonPipe)
+
+    -- Import the tarball to the content store
+    (files, packageJson) <- runConduitRes $
+                                     getFromURI distURI
+                                  .| ungzipIfCompressed
+                                  .| CT.untar
+                                  .| tarSink
+
+    -- Insert the metadata
+    source <- loadIntoMDDB packageJson files
+
+    -- Link the dependencies for the source
+    void $ rebuildNPM source
+ where
+    -- TODO handle TarExceptions
+    tarEntryToFile :: (MonadError String m, MonadThrow m, MonadIO m) => ContentStore -> Conduit CT.TarChunk m Files
+    tarEntryToFile cs =
+        -- Run the tar processing in a state with a map from FilePath to (ObjectDigest, CT.Size),
+        -- so hardlinks can get the data they need from earlier entries.
+        evalStateLC HM.empty $ CT.withEntries handleEntry
+     where
+        handleEntry :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m, MonadIO m) => CT.Header -> Conduit BS.ByteString m Files
+        handleEntry header@CT.Header{..} = do
+            let entryPath = CT.headerFilePath header
+
+            -- Ignore the mode from tar. Set everything to 0644 if it's a file, 0755 if it's a directory
+            let modeBits = if CT.headerFileType header == CT.FTDirectory then 0o0755 else 0o0644
+
+            -- Add the file type bits to the mode based on the tar header type
+            let typeBits = case CT.headerFileType header of
+                    CT.FTNormal           -> regularFileMode
+                    CT.FTHardLink         -> regularFileMode
+                    CT.FTSymbolicLink     -> symbolicLinkMode
+                    CT.FTCharacterSpecial -> characterSpecialMode
+                    CT.FTBlockSpecial     -> blockSpecialMode
+                    CT.FTDirectory        -> directoryMode
+                    CT.FTFifo             -> namedPipeMode
+                    -- TODO?
+                    CT.FTOther _          -> 0
+
+            -- Make the start of a Files record. Ignore the user/group/mode from tar
+            let baseFile = Files{filesPath       = T.pack ("/" </> normalise entryPath),
+                                 filesFile_user  = "root",
+                                 filesFile_group = "root",
+                                 filesMtime      = fromIntegral headerTime,
+                                 filesMode       = modeBits .|. fromIntegral typeBits,
+                                 filesTarget     = Nothing,
+                                 filesCs_object  = Nothing,
+                                 filesSize       = 0}
+
+            file <- case CT.headerFileType header of
+                -- for NormalFile, add the object to the content store, add the digest and size to the state, and add the digest in the record
+                CT.FTNormal       -> handleRegularFile baseFile entryPath headerPayloadSize
+                -- For hard links, the content is the link target: look it up in the state and fill in the digest and size
+                CT.FTHardLink     -> handleHardLink baseFile
+
+                -- for symlinks, set the target
+                CT.FTSymbolicLink -> handleSymlink baseFile
+
+                -- TODO?
+                CT.FTOther code   -> throwError $ "Unknown tar entry type " ++ show code
+
+                -- TODO: need somewhere for block/char special major and minor
+                -- otherwise nothing else has anything special
+                _                 -> return baseFile
+
+            yield file
+
+        handleRegularFile :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m, MonadIO m) => Files -> FilePath -> CT.Size -> Consumer BS.ByteString m Files
+        handleRegularFile baseFile entryPath size = do
+            digest <- toConsumer $ storeByteStringSink cs
+            modify (HM.insert entryPath (digest, size))
+            return $ baseFile {filesSize      = fromIntegral size,
+                               filesCs_object = Just $ convert digest}
+
+        handleHardLink :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m) => Files -> Consumer BS.ByteString m Files
+        handleHardLink baseFile = do
+            -- Use the same ByteString -> FilePath unpacking that headerFilePath uses
+            target <- S8.unpack <$> CC.fold
+            (HM.lookup target <$> get) >>=
+                maybe (throwError $ "Broken hard link to " ++ target)
+                      (\(digest, size) -> return $ baseFile {filesSize      = fromIntegral size,
+                                                             filesCs_object = Just $ convert digest})
+
+        handleSymlink :: Monad m => Files -> Consumer BS.ByteString m Files
+        handleSymlink baseFile = do
+            target <- decodeUtf8 <$> CC.fold
+            return $ baseFile {filesTarget = Just target}
+
+    -- TODO handle TarExceptions
+    parsePackageJson :: (MonadError String m, MonadThrow m) => Consumer CT.TarChunk m PackageJSON
+    parsePackageJson = CT.withEntry handler >>= maybe parsePackageJson return
+     where
+        handler :: MonadError String m => CT.Header -> Consumer BS.ByteString m (Maybe PackageJSON)
+        handler header = let
+            path = makeRelative "/" $ normalise $ CT.headerFilePath header
+         in
+            -- Everything in an npm tarball is under "package/"
+            if path == ("package" </> "package.json") then
+                (eitherDecode <$> BSL.fromStrict <$> CC.fold) >>= either throwError (return . Just)
+            else
+                return Nothing
 
 loadIntoMDDB :: MonadIO m => PackageJSON -> [Files] -> SqlPersistT m (Key Sources)
 loadIntoMDDB PackageJSON{..} files = do
@@ -413,126 +578,6 @@ loadFromURI uri@URI{..} = do
     db <- stDB <$> ask
     repo <- stRepo <$> ask
 
-    result <- runExceptT $ do
-        -- Fetch the JSON describing the package
-        distJson <- readRegistryJSON uriPath
-
-        -- Get the URI to the tarball out of the JSON
-        let distTarball = T.unpack $ tarball distJson
-        distURI <- maybe (throwError $ "Error parsing dist URI: " ++ distTarball) return $ parseURI distTarball
-
-        -- conduits for consuming the tar entries:
-        -- this one loads the content into the content store and returns a list of (uninserted) Files records
-        let pathPipe = tarEntryToFile repo .| CL.consume
-        -- this one returns the parsed package.json
-        let jsonPipe = parsePackageJson
-
-        -- Zip them together into a sink returning a tuple
-        let tarSink = getZipConduit ((,) <$> ZipConduit pathPipe
-                                         <*> ZipConduit jsonPipe)
-
-        -- Import the tarball to the content store
-        (files, packageJson) <- runConduitRes $
-                                         getFromURI distURI
-                                      .| ungzipIfCompressed
-                                      .| CT.untar
-                                      .| tarSink
-
-        -- Insert the metadata
-        checkAndRunSqlite (T.pack db) $ do
-            source <- loadIntoMDDB packageJson files
-
-            -- Link the dependencies for the source
-            rebuildNPM source
+    result <- runExceptT $ checkAndRunSqlite (T.pack db) $ importPackage repo uriPath Latest
 
     whenLeft result (\e -> liftIO $ print $ "Error importing " ++ show uri ++ ": " ++ show e)
-
- where
-    -- TODO handle TarExceptions
-    tarEntryToFile :: (MonadError String m, MonadThrow m, MonadIO m) => ContentStore -> Conduit CT.TarChunk m Files
-    tarEntryToFile cs =
-        -- Run the tar processing in a state with a map from FilePath to (ObjectDigest, CT.Size),
-        -- so hardlinks can get the data they need from earlier entries.
-        evalStateLC HM.empty $ CT.withEntries handleEntry
-     where
-        handleEntry :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m, MonadIO m) => CT.Header -> Conduit BS.ByteString m Files
-        handleEntry header@CT.Header{..} = do
-            let entryPath = CT.headerFilePath header
-
-            -- Ignore the mode from tar. Set everything to 0644 if it's a file, 0755 if it's a directory
-            let modeBits = if CT.headerFileType header == CT.FTDirectory then 0o0755 else 0o0644
-
-            -- Add the file type bits to the mode based on the tar header type
-            let typeBits = case CT.headerFileType header of
-                    CT.FTNormal           -> regularFileMode
-                    CT.FTHardLink         -> regularFileMode
-                    CT.FTSymbolicLink     -> symbolicLinkMode
-                    CT.FTCharacterSpecial -> characterSpecialMode
-                    CT.FTBlockSpecial     -> blockSpecialMode
-                    CT.FTDirectory        -> directoryMode
-                    CT.FTFifo             -> namedPipeMode
-                    -- TODO?
-                    CT.FTOther _          -> 0
-
-            -- Make the start of a Files record. Ignore the user/group/mode from tar
-            let baseFile = Files{filesPath       = T.pack ("/" </> normalise entryPath),
-                                 filesFile_user  = "root",
-                                 filesFile_group = "root",
-                                 filesMtime      = fromIntegral headerTime,
-                                 filesMode       = modeBits .|. fromIntegral typeBits,
-                                 filesTarget     = Nothing,
-                                 filesCs_object  = Nothing,
-                                 filesSize       = 0}
-
-            file <- case CT.headerFileType header of
-                -- for NormalFile, add the object to the content store, add the digest and size to the state, and add the digest in the record
-                CT.FTNormal       -> handleRegularFile baseFile entryPath headerPayloadSize
-                -- For hard links, the content is the link target: look it up in the state and fill in the digest and size
-                CT.FTHardLink     -> handleHardLink baseFile
-
-                -- for symlinks, set the target
-                CT.FTSymbolicLink -> handleSymlink baseFile
-
-                -- TODO?
-                CT.FTOther code   -> throwError $ "Unknown tar entry type " ++ show code
-
-                -- TODO: need somewhere for block/char special major and minor
-                -- otherwise nothing else has anything special
-                _                 -> return baseFile
-
-            yield file
-
-        handleRegularFile :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m, MonadIO m) => Files -> FilePath -> CT.Size -> Consumer BS.ByteString m Files
-        handleRegularFile baseFile entryPath size = do
-            digest <- toConsumer $ storeByteStringSink cs
-            modify (HM.insert entryPath (digest, size))
-            return $ baseFile {filesSize      = fromIntegral size,
-                               filesCs_object = Just $ convert digest}
-
-        handleHardLink :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m) => Files -> Consumer BS.ByteString m Files
-        handleHardLink baseFile = do
-            -- Use the same ByteString -> FilePath unpacking that headerFilePath uses
-            target <- S8.unpack <$> CC.fold
-            (HM.lookup target <$> get) >>=
-                maybe (throwError $ "Broken hard link to " ++ target)
-                      (\(digest, size) -> return $ baseFile {filesSize      = fromIntegral size,
-                                                             filesCs_object = Just $ convert digest})
-
-        handleSymlink :: Monad m => Files -> Consumer BS.ByteString m Files
-        handleSymlink baseFile = do
-            target <- decodeUtf8 <$> CC.fold
-            return $ baseFile {filesTarget = Just target}
-
-    -- TODO handle TarExceptions
-    parsePackageJson :: (MonadError String m, MonadThrow m) => Consumer CT.TarChunk m PackageJSON
-    parsePackageJson = CT.withEntry handler >>= maybe parsePackageJson return
-     where
-        handler :: MonadError String m => CT.Header -> Consumer BS.ByteString m (Maybe PackageJSON)
-        handler header = let
-            path = makeRelative "/" $ normalise $ CT.headerFilePath header
-         in
-            -- Everything in an npm tarball is under "package/"
-            if path == ("package" </> "package.json") then
-                (eitherDecode <$> BSL.fromStrict <$> CC.fold) >>= either throwError (return . Just)
-            else
-                return Nothing
