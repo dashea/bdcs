@@ -83,7 +83,6 @@ library
                         BDCS.RPM.Sources,
                         BDCS.RPM.Utils,
                         BDCS.Version,
-                        Build.NPM,
                         Export.Directory,
                         Export.Qcow2,
                         Export.Ostree,
