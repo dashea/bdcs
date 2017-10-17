@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TupleSections #-}
 
 -- |
 -- Module: BDCS.Import.NPM
@@ -12,10 +13,11 @@
 --
 -- Functions for importing NPM packages into the database
 
-module BDCS.Import.NPM(loadFromURI)
+module BDCS.Import.NPM(loadFromURI,
+                       rebuildNPM)
  where
 
-import           Control.Monad(void)
+import           Control.Monad(forM_, void, when)
 import           Control.Monad.Catch(MonadThrow)
 import           Control.Monad.Except(MonadError, runExceptT, throwError)
 import           Control.Monad.IO.Class(MonadIO, liftIO)
@@ -24,12 +26,13 @@ import           Control.Monad.State(MonadState, gets, modify)
 import           Control.Monad.Trans.Resource(MonadBaseControl, MonadResource)
 import           Data.Aeson(FromJSON(..), Object, Value(..), (.:), (.:?), (.!=), eitherDecode, withObject, withText)
 import           Data.Aeson.Types(Parser, typeMismatch)
+import           Data.Bifunctor(bimap)
 import           Data.Bits((.|.))
 import           Data.ByteArray(convert)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as BSL
-import           Data.Conduit(Conduit, Consumer, ZipConduit(..), (.|), getZipConduit, runConduitRes, toConsumer, yield)
+import           Data.Conduit(Conduit, Consumer, ZipConduit(..), (.|), getZipConduit, runConduitRes, sourceToList, toConsumer, yield)
 import           Data.Conduit.Binary(sinkLbs)
 import qualified Data.Conduit.Combinators as CC
 import qualified Data.Conduit.List as CL
@@ -38,22 +41,27 @@ import qualified Data.Conduit.Tar as CT
 import           Data.ContentStore(ContentStore, storeByteStringSink)
 import           Data.ContentStore.Digest(ObjectDigest)
 import qualified Data.HashMap.Lazy as HM
-import           Data.List(isPrefixOf)
+import           Data.List(isPrefixOf, scanl')
 import           Data.Maybe(fromMaybe)
 import qualified Data.Text as T
 import           Data.Text.Encoding(decodeUtf8)
-import           Database.Persist.Sql(SqlPersistT)
+import           Data.Time.Clock(UTCTime, getCurrentTime)
+import           Data.Time.Clock.POSIX(utcTimeToPOSIXSeconds)
+import           Database.Esqueleto(InnerJoin(..), (^.), (==.), (&&.), from, limit, on, select, unValue, val, where_)
+import           Database.Persist.Sql(SqlPersistT, insert)
 import           Network.URI(URI(..), URIAuth(..), nullURI, parseURI, relativeTo)
-import           System.FilePath((</>), makeRelative, normalise, takeDirectory, takeFileName)
+import           System.FilePath((</>), joinPath, makeRelative, normalise, splitDirectories, takeDirectory, takeFileName)
 import           System.Posix.Files(blockSpecialMode, characterSpecialMode, directoryMode, namedPipeMode, regularFileMode, symbolicLinkMode)
 import           Text.Regex.PCRE((=~))
 
-import BDCS.Build.NPM(rebuildNPM)
+import BDCS.Builds(insertBuild, insertBuildKeyValue)
 import BDCS.DB
-import BDCS.Files(associateFilesWithSource, insertFiles)
+import BDCS.Files(associateFilesWithBuild, associateFilesWithSource, insertFiles, sourceIdToFiles)
 import BDCS.Import.Conduit(getFromURI, ungzipIfCompressed)
 import BDCS.Import.State(ImportState(..))
 import BDCS.KeyType
+import BDCS.Label.FileLabels(apply)
+import BDCS.NPM.SemVer(SemVer, SemVerRangeSet, parseSemVer, parseSemVerRangeSet, satisfies, toText)
 import BDCS.Projects(insertProject)
 import BDCS.Sources(insertSource, insertSourceKeyValue)
 import BDCS.Utils.Either(whenLeft)
@@ -164,7 +172,7 @@ instance FromJSON PackageJSON where
         parseTextObject = withObject "Object" $ HM.foldrWithKey f (return [])
          where
             f :: T.Text -> Value -> Parser [(T.Text, T.Text)] -> Parser [(T.Text, T.Text)]
-            f key val acc = withText "String" (\s -> ((key, s):) <$> acc) val
+            f key v acc = withText "String" (\s -> ((key, s):) <$> acc) v
 
 readRegistryJSON :: (MonadError String m, MonadBaseControl IO m, MonadThrow m, MonadIO m) => String -> m PackageDist
 readRegistryJSON pkgname = do
@@ -244,6 +252,156 @@ loadIntoMDDB PackageJSON{..} files = do
         manFiles = filter (\p -> (manPrefix `isPrefixOf` p) && (p =~ ("\\.[0-9]$" :: String))) paths
      in
         mapM_ (\p -> insertSourceKeyValue (TextKey "man") (T.pack p) Nothing sourceId) manFiles
+
+rebuildNPM :: (MonadBaseControl IO m, MonadError String m, MonadResource m) => Key Sources -> SqlPersistT m [Key Builds]
+rebuildNPM sourceId = do
+    -- get the name and version for this source
+    (name, version) <- getNameVer
+
+    -- figure out what sources satisfy the dependencies for this package
+    -- Each list element represents one of the dependencies, within those each
+    -- element is a source ID that satisfies the dependencies. sequence the whole thing
+    -- to get all of the possible combinations that satisfy all dependencies.
+    dependencies <- sequence <$> getDeps
+
+    -- get the list of files for this source
+    sourceFiles <- sourceToList $ sourceIdToFiles sourceId
+
+    -- For each dependency list, create a new build
+    mapM (relink sourceFiles (name, version)) dependencies
+ where
+    copyFile :: Files -> FilePath -> Files
+    copyFile f@Files{..} newPath = let
+        basePath = makeRelative "/package" $ T.unpack filesPath
+     in
+        f {filesPath = T.pack $ newPath </> basePath}
+
+    getDeps :: (MonadIO m, MonadError String m) => SqlPersistT m [[(T.Text, SemVer)]]
+    getDeps = do
+        -- fetch the list of dependencies
+        -- the dependencies for a given source are stored as key/vals, k="dependency", v=package name, e=version expression
+        kvs <- select $ from $ \(kv `InnerJoin` skv) -> do
+               on     $ kv ^. KeyValId ==. skv ^. SourceKeyValuesKey_val_id
+               where_ $ skv ^. SourceKeyValuesSource_id ==. val sourceId &&.
+                        kv ^. KeyValKey_value ==. val (TextKey "dependency")
+               return (kv ^. KeyValVal_value, kv ^. KeyValExt_value)
+        depnames <- mapM (unpackName . fst) kvs
+        depvers <- mapM (unpackVersion . snd) kvs
+
+        mapM getOneDep $ zip depnames depvers
+     where
+        unpackName name = maybe (throwError "Invalid dependency name") return $ unValue name
+
+        unpackVersion ver = do
+            unmaybe <- maybe (throwError "Invalid dependency version") return $ unValue ver
+            either (throwError . show) return $ parseSemVerRangeSet unmaybe
+
+    getOneDep :: (MonadIO m, MonadError String m) => (T.Text, SemVerRangeSet) -> SqlPersistT m [(T.Text, SemVer)]
+    getOneDep (name, range) = do
+        -- Get all npm Sources records that match the name
+        sources <- select $ from $ \(p `InnerJoin` s `InnerJoin` skv `InnerJoin` kv) -> do
+                   on     $ kv ^. KeyValId ==. skv ^. SourceKeyValuesKey_val_id
+                   on     $ s ^. SourcesId ==. skv ^. SourceKeyValuesSource_id
+                   on     $ p ^. ProjectsId ==. s ^. SourcesProject_id
+                   where_ $ kv ^. KeyValKey_value ==. val (TextKey "npm") &&.
+                            p ^. ProjectsName ==. val name
+                   return $ s ^. SourcesVersion
+
+        -- if nothing is found, that's an error
+        when (null sources) $ throwError $ "Unable to satisfy dependency for " ++ show name ++ " " ++ show range
+
+        -- Parse the versions into SemVers
+        versions <- mapM unpackVersion sources
+
+        let filteredVersions = filter (`satisfies` range) versions
+        return $ zip (repeat name) filteredVersions
+
+     where
+        unpackVersion ver = either (throwError . show) return $ parseSemVer $ unValue ver
+
+    getNameVer :: (MonadIO m, MonadError String m) => SqlPersistT m (T.Text, T.Text)
+    getNameVer = do
+        nv <- select $ from $ \(sources `InnerJoin` projects) -> do
+              on     $ sources ^. SourcesProject_id ==. projects ^. ProjectsId
+              where_ $ sources ^. SourcesId ==. val sourceId
+              limit 1
+              return   (projects ^. ProjectsName, sources ^. SourcesVersion)
+
+        case nv of
+            hd:_ -> return $ bimap unValue unValue hd
+            _    -> throwError $ "No such source id " ++ show sourceId
+
+    relink :: (MonadBaseControl IO m, MonadIO m) => [Files] -> (T.Text, T.Text) -> [(T.Text, SemVer)] -> SqlPersistT m (Key Builds)
+    relink sourceFiles (name, ver) depList = do
+        buildTime <- liftIO getCurrentTime
+
+        -- Create a directory for this module in /usr/lib/node_modules
+        -- NB: In order to allow multiple versions of an npm module to be included in the same export,
+        -- the /usr/lib/node_modules name is <module-name>@<module-version> instead of just <module-name>,
+        -- and none of the bin or man symlinks are installed to /usr/bin and /usr/share/man. It's up to the
+        -- export to determine which modules need to be accessible system-wide and to create the bin and man
+        -- symlinks and the /usr/lib/node_modules/<module-name> directory.
+        let module_dir = "/" </> "usr" </> "lib" </> "node_modules" </> T.unpack (T.concat [name, "@", ver])
+
+        -- Create the /usr/lib/node_modules/<package> directory, and a node_modules directory under that
+        moduleDirsIds <- mkdirs buildTime $ module_dir </> "node_modules"
+
+        -- Copy everything from the Source into the module directory
+        let packageFiles = map (`copyFile` module_dir) sourceFiles
+        packageFilesIds <- mapM (\file -> (file,) <$> insert file) packageFiles
+
+        -- For each of the dependencies, create a symlink from the /usr/lib/node_modules/<name>@<version> directory
+        -- to this module's node_modules directory.
+        deplinkFilesIds <- mapM (createDepLink module_dir buildTime) depList
+
+
+        -- Apply the file-based labels
+        let buildFilesIds = moduleDirsIds ++ packageFilesIds ++ deplinkFilesIds
+        void $ apply buildFilesIds
+
+        -- Create a build and add the files to it
+        createBuild $ map snd buildFilesIds
+     where
+        createDepLink :: MonadIO m => FilePath -> UTCTime -> (T.Text, SemVer) -> SqlPersistT m (Files, Key Files)
+        createDepLink module_dir buildTime (depname, depver) = let
+            verstr = toText depver
+            source = T.pack $ joinPath ["/", "usr", "lib", "node_modules", T.unpack (T.concat [depname, "@", verstr])]
+            dest   = T.pack $ joinPath [module_dir, "node_modules", T.unpack depname]
+            link   = Files dest "root" "root" (floor $ utcTimeToPOSIXSeconds buildTime) Nothing (fromIntegral $ symbolicLinkMode .|. 0o0644) 0 (Just source)
+         in
+            (link,) <$> insert link
+
+        mkdirs :: MonadIO m => UTCTime -> FilePath -> SqlPersistT m [(Files, Key Files)]
+        mkdirs buildTime path = mapM mkdir $ scanl' (</>) "/" $ splitDirectories path
+         where
+            mkdir :: MonadIO m => FilePath -> SqlPersistT m (Files, Key Files)
+            mkdir subPath = let
+                newdir = Files (T.pack subPath) "root" "root" (floor $ utcTimeToPOSIXSeconds buildTime) Nothing (fromIntegral $ directoryMode .|. 0o0755) 0 Nothing
+             in
+                (newdir,) <$> insert newdir
+
+        createBuild :: MonadIO m => [Key Files] -> SqlPersistT m (Key Builds)
+        createBuild fids = do
+            buildTime <- liftIO getCurrentTime
+
+            -- There is no equivalent to epoch or release in npm, so use 0 and ""
+            let epoch = 0
+            let release = ""
+            -- FIXME there are some npm packages that are arch-specific but for now ignore those
+            let arch = "noarch"
+            -- FIXME changelog?
+            let changelog = ""
+            -- FIXME ??
+            let build_config_ref = "BUILD_CONFIG_REF"
+            let build_env_ref = "BUILD_ENV_REF"
+
+            buildId <- insertBuild $ Builds sourceId epoch release arch buildTime changelog build_config_ref build_env_ref
+            void $ associateFilesWithBuild fids buildId
+
+            -- Record the exact-version dependencies used for this build
+            forM_ depList $ \(n, v) -> insertBuildKeyValue (TextKey "dependency") n (Just $ toText v) buildId
+
+            return buildId
 
 -- | Fetch an NPM from a given 'URI' and load it into the MDDB.  This function must be
 -- run within the 'ReaderT' monad, which should be given an 'ImportState' record.  This

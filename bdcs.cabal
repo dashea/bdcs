@@ -41,8 +41,7 @@ source-repository       head
 library
     hs-source-dirs:     src
 
-    exposed-modules:    BDCS.Build.NPM,
-                        BDCS.Builds,
+    exposed-modules:    BDCS.Builds,
                         BDCS.CS,
                         BDCS.DB,
                         BDCS.Depclose,
