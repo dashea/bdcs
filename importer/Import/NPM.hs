@@ -259,7 +259,7 @@ importJSON repo distJson = do
     source <- loadIntoMDDB packageJson files
 
     -- Link the dependencies for the source
-    void $ rebuildNPM source
+    void $ rebuildNPM repo source
  where
     -- TODO handle TarExceptions
     tarEntryToFile :: (MonadError String m, MonadThrow m, MonadIO m) => ContentStore -> Conduit CT.TarChunk m Files
@@ -423,8 +423,8 @@ loadIntoMDDB PackageJSON{..} files = do
      in
         mapM_ (\p -> insertSourceKeyValue (TextKey "man") (T.pack p) Nothing sourceId) manFiles
 
-rebuildNPM :: (MonadBaseControl IO m, MonadIO m, MonadError String m, MonadResource m) => Key Sources -> SqlPersistT m [Key Builds]
-rebuildNPM sourceId = do
+rebuildNPM :: (MonadBaseControl IO m, MonadError String m, MonadResource m) => ContentStore -> Key Sources -> SqlPersistT m [Key Builds]
+rebuildNPM repo sourceId = do
     -- get the name and version for this source
     (name, version) <- getNameVer
 
@@ -446,7 +446,7 @@ rebuildNPM sourceId = do
      in
         f {filesPath = T.pack $ newPath </> basePath}
 
-    getDeps :: (MonadIO m, MonadError String m) => SqlPersistT m [[(T.Text, SemVer)]]
+    getDeps :: (MonadResource m, MonadBaseControl IO m, MonadError String m) => SqlPersistT m [[(T.Text, SemVer)]]
     getDeps = do
         -- fetch the list of dependencies
         -- the dependencies for a given source are stored as key/vals, k="dependency", v=package name, e=version expression
@@ -458,7 +458,7 @@ rebuildNPM sourceId = do
         depnames <- mapM (unpackName . fst) kvs
         depvers <- mapM (unpackVersion . snd) kvs
 
-        mapM getOneDep $ zip depnames depvers
+        mapM (getOneDep True) $ zip depnames depvers
      where
         unpackName name = maybe (throwError "Invalid dependency name") return $ unValue name
 
@@ -466,8 +466,8 @@ rebuildNPM sourceId = do
             unmaybe <- maybe (throwError "Invalid dependency version") return $ unValue ver
             either (throwError . show) return $ parseSemVerRangeSet unmaybe
 
-    getOneDep :: (MonadIO m, MonadError String m) => (T.Text, SemVerRangeSet) -> SqlPersistT m [(T.Text, SemVer)]
-    getOneDep (name, range) = do
+    getOneDep :: (MonadResource m, MonadBaseControl IO m, MonadError String m) => Bool -> (T.Text, SemVerRangeSet) -> SqlPersistT m [(T.Text, SemVer)]
+    getOneDep fetchDeps (name, range) = do
         -- Get all npm Sources records that match the name
         sources <- select $ from $ \(p `InnerJoin` s `InnerJoin` skv `InnerJoin` kv) -> do
                    on     $ kv ^. KeyValId ==. skv ^. SourceKeyValuesKey_val_id
@@ -477,14 +477,24 @@ rebuildNPM sourceId = do
                             p ^. ProjectsName ==. val name
                    return $ s ^. SourcesVersion
 
-        -- if nothing is found, that's an error
-        when (null sources) $ throwError $ "Unable to satisfy dependency for " ++ show name ++ " " ++ show range
 
         -- Parse the versions into SemVers
         versions <- mapM unpackVersion sources
 
+        -- Filter to just the ones that match the version range
         let filteredVersions = filter (`satisfies` range) versions
-        return $ zip (repeat name) filteredVersions
+
+        -- if nothing is found, that's an error
+        -- Try to import the dependency and repeat
+        -- Don't import deps when repeating so we don't get stuck in a loop
+        if null sources then
+            if not fetchDeps then
+                throwError $ "Unable to satisfy dependency for " ++ show name ++ " " ++ show range
+            else do
+                importPackage repo (T.unpack name) (Range range)
+                getOneDep False (name, range)
+        else
+            return $ zip (repeat name) filteredVersions
 
      where
         unpackVersion ver = either (throwError . show) return $ parseSemVer $ unValue ver
