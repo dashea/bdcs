@@ -299,21 +299,21 @@ importJSON repo distJson = do
 
             file <- case CT.headerFileType header of
                 -- for NormalFile, add the object to the content store, add the digest and size to the state, and add the digest in the record
-                CT.FTNormal       -> handleRegularFile baseFile entryPath headerPayloadSize
+                CT.FTNormal       -> Just <$> handleRegularFile baseFile entryPath headerPayloadSize
                 -- For hard links, the content is the link target: look it up in the state and fill in the digest and size
-                CT.FTHardLink     -> handleHardLink baseFile
+                CT.FTHardLink     -> Just <$> handleHardLink baseFile
 
                 -- for symlinks, set the target
-                CT.FTSymbolicLink -> handleSymlink baseFile
+                CT.FTSymbolicLink -> Just <$> handleSymlink baseFile
 
-                -- TODO?
-                CT.FTOther code   -> throwError $ "Unknown tar entry type " ++ show code
+                -- skip unknown headers
+                CT.FTOther _      -> return Nothing
 
                 -- TODO: need somewhere for block/char special major and minor
                 -- otherwise nothing else has anything special
-                _                 -> return baseFile
+                _                 -> return $ Just baseFile
 
-            yield file
+            maybe (return ()) yield file
 
         handleRegularFile :: (MonadState (HM.HashMap FilePath (ObjectDigest, CT.Size)) m, MonadError String m, MonadIO m) => Files -> FilePath -> CT.Size -> Consumer BS.ByteString m Files
         handleRegularFile baseFile entryPath size = do
