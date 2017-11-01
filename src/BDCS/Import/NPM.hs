@@ -192,14 +192,21 @@ instance FromJSON PackageJSON where
             f :: T.Text -> Value -> Parser [(T.Text, T.Text)] -> Parser [(T.Text, T.Text)]
             f key v acc = withText "String" (\s -> ((key, s):) <$> acc) v
 
+-- The NPM registry doesn't use any kind of sensible URL character replacement,
+-- it just wants / to be %2F and everything else to stay as-is.
+escapeNPMName :: T.Text -> T.Text
+escapeNPMName = T.replace "/" "%2F"
+
 readRegistryJSON :: (MonadError String m, MonadBaseControl IO m, MonadThrow m, MonadIO m) => String -> PackageVersion -> m [PackageDist]
 readRegistryJSON pkgname Latest = do
-    let uri = relativeTo (nullURI {uriPath = pkgname ++ "/latest"}) npmRegistry
+    let pkgURL = T.unpack (escapeNPMName $ T.pack pkgname)
+    let uri = relativeTo (nullURI {uriPath = pkgURL ++ "/latest"}) npmRegistry
     jsonData <- runConduitRes $ getFromURI uri .| sinkLbs
     either throwError (return . (:[])) $ eitherDecode jsonData
 
 readRegistryJSON pkgname (Range range) = do
-    let uri = relativeTo (nullURI {uriPath = pkgname}) npmRegistry
+    let pkgURL = T.unpack (escapeNPMName $ T.pack pkgname)
+    let uri = relativeTo (nullURI {uriPath = pkgURL}) npmRegistry
 
     -- Fetch the list of all available versions
     jsonData <- runConduitRes $ getFromURI uri .| sinkLbs
