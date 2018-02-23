@@ -19,7 +19,9 @@ module BDCS.Depsolve(Formula(..),
                      CNFAtom(..),
                      CNFFormula,
                      DepAssignment,
+                     NFormula(..),
                      formulaToCNF,
+                     nFormulaToFormula,
                      solveCNF
 -- export private symbols for testing
 #ifdef TEST
@@ -38,6 +40,16 @@ import           Data.Set(Set)
 import qualified Data.Set as Set
 
 import BDCS.Utils.Monad(concatMapM)
+
+-- | A negatible logical proposition. This is a proposition that can contain
+-- a negative proposition, so it may not be in negation normal form.
+--
+-- A proposition needs to be converted to negation normal form ('Formula') before
+-- it can be converted to CNF, so when possible use 'Formula'.
+data NFormula a = NAtom a
+                | NNot (NFormula a)
+                | NOr [NFormula a]
+                | NAnd [NFormula a]
 
 -- | A logical proposition in negation normal form. Negation can only
 -- be applied to atoms, not to other entire sub-formulas.
@@ -67,6 +79,23 @@ data CNFAtom a = CNFAtom (CNFLiteral a)
 -- In other words, a CNFFormula of the form [[a1, a2, ...], [b1, b2, ...], ...]
 -- represents a proposition of the form ((a1 OR a2 OR ...) AND (b1 OR b2 OR ...) AND ...)
 type CNFFormula a = [[CNFAtom a]]
+
+-- | Convert a negatible formula ('NFormula') into negation normal form ('Formula')
+nFormulaToFormula :: NFormula a -> Formula a
+-- The easy ones: directly map to Atom, And, Or
+nFormulaToFormula (NAtom a) = Atom a
+nFormulaToFormula (NOr l)   = Or $ map nFormulaToFormula l
+nFormulaToFormula (NAnd l)  = And $ map nFormulaToFormula l
+
+-- ~a is negation normal
+nFormulaToFormula (NNot (NAtom a)) = Not a
+-- ~(~a) -> a
+nFormulaToFormula (NNot (NNot f)) = nFormulaToFormula f
+-- The De Morgan's law ones, where we keep moving NOT inwards until it hits an atom:
+-- ~(P OR Q) -> (~P) AND (~Q)
+nFormulaToFormula (NNot (NOr l)) = nFormulaToFormula $ NAnd $ map NNot l
+-- ~(P AND Q) -> (~P) OR (~Q)
+nFormulaToFormula (NNot (NAnd l)) = nFormulaToFormula $ NOr $ map NNot l
 
 -- | Convert a 'Formula' to conjunctive normal form
 formulaToCNF :: Formula a -> CNFFormula a

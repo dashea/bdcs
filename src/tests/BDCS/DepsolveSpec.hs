@@ -187,3 +187,29 @@ spec = do
             let formula = [[CNFAtom (CNFOriginal '1')]]
             let solution = [('1', True)]
             runExceptT (solveCNF formula) >>= (`shouldBe` Right solution)
+
+    describe "BDCS.Depsolve.nFormulaToFormula tests" $ do
+        it "atom" $
+            nFormulaToFormula (NAtom '1') `shouldBe` Atom '1'
+
+        it "not atom" $
+            nFormulaToFormula (NNot (NAtom '1')) `shouldBe` Not '1'
+
+        it "and, simple" $
+            nFormulaToFormula (NAnd [NAtom '1', NAtom '2', NAtom '3']) `shouldBe`
+                And [Atom '1', Atom '2', Atom '3']
+
+        it "or, simple" $
+            nFormulaToFormula (NOr [NAtom '1', NAtom '2', NAtom '3']) `shouldBe`
+                Or [Atom '1', Atom '2', Atom '3']
+
+        it "not not" $
+            nFormulaToFormula (NNot (NNot (NAtom '1'))) `shouldBe` Atom '1'
+
+        it "not or" $
+            nFormulaToFormula (NNot (NOr [NAtom '1', NAtom '2', NAtom '3'])) `shouldBe`
+                And [Not '1', Not '2', Not '3']
+
+        it "not and" $
+            nFormulaToFormula (NNot (NAnd [NAtom '1', NAtom '2', NAtom '3'])) `shouldBe`
+                Or [Not '1', Not '2', Not '3']
