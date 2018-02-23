@@ -39,8 +39,8 @@ import qualified Data.Set as Set
 
 import BDCS.Utils.Monad(concatMapM)
 
--- A logical proposition in negation normal form
--- (i.e., NOT is applied only to atoms, not sub-formulas)
+-- | A logical proposition in negation normal form. Negation can only
+-- be applied to atoms, not to other entire sub-formulas.
 data Formula a = Atom a
                | Not a
                | Or [Formula a]
@@ -48,21 +48,27 @@ data Formula a = Atom a
 
  deriving(Eq, Show)
 
--- Conjunctive Normal Form (CNF) is, essentially, and AND of ORs. The formula is of the form
--- (a1 OR a2 ...) AND (b1 OR b2 OR ...) AND ...
--- where each a1, b2, etc is an atom or a not-atom.
--- To keep the size of converted formulas under control, some extra variables are added to represent
--- sub-formulas from the original expression.
+-- | The propositional variable type used by 'CNFFormula'. In order to keep the size of the formula
+-- smaller, this module inserts new propositional variables into the formula to generate a CNFFormula
+-- that is equisatisfiable to the original Formula.  A CNFLiteral represents either an Atom from the
+-- original 'Formula' or a new, inserted variable.
 data CNFLiteral a = CNFOriginal a
                   | CNFSubstitute Int
  deriving(Eq, Ord, Show)
 
+-- | A single piece of a 'CNFFormula'. Each piece can either be a 'CNFLiteral', or not a 'CNFLiteral'.
 data CNFAtom a = CNFAtom (CNFLiteral a)
                | CNFNot (CNFLiteral a)
  deriving(Eq, Ord, Show)
 
+-- | A formula in conjunctive normal form (CNF). A formula is a conjunction of clauses, wherein each clause
+-- is a disjunction of literals.
+--
+-- In other words, a CNFFormula of the form [[a1, a2, ...], [b1, b2, ...], ...]
+-- represents a proposition of the form ((a1 OR a2 OR ...) AND (b1 OR b2 OR ...) AND ...)
 type CNFFormula a = [[CNFAtom a]]
 
+-- | Convert a 'Formula' to conjunctive normal form
 formulaToCNF :: Formula a -> CNFFormula a
 formulaToCNF f =
     -- wrap the call in a State Int starting at 0 to create a counter for substitution variables
@@ -146,14 +152,17 @@ formulaToCNF f =
         -- combine the results
         return (lhSubCNF ++ rhSubCNF)
 
--- assignments to literals that will satisfy a formula
+-- | Assignments to literals that will satisfy a formula.
 type DepAssignment a = (a, Bool)
 
 -- internal types for the variable=bool assignments
 type AssignmentMap a = Map (CNFLiteral a) Bool
 
--- if the formula is unsolvable, returns Nothing, other Just the list of assignments
--- This function uses the Davis-Putnam-Logemann-Loveman procedure for satisfying the formula, which is as follows:
+-- | Solve a 'CNFFormula'.
+--
+-- If the formula is unsolvable, this function returns Nothing, otherwise it returns Just the list of assignments
+--
+-- This function uses the Davis-Putnam-Logemann-Loveland procedure for satisfying the formula, which is as follows:
 --   Repeatedly simplify the formula using unit propagation and pure literal elimination:
 --     unit propagation looks for a clause that contains only one literal, assigns it, and then removes clauses satisfied by the assignment
 --       for example, in
@@ -167,7 +176,7 @@ type AssignmentMap a = Map (CNFLiteral a) Bool
 --
 --  once simplified, pick a literal and assign it to True and try to satisfy the formula. If that doesn't work, assign to to False.
 --
---  Repeat until solved.
+--  Repeat until solved, or until no solution can be found.
 solveCNF :: (MonadError String m, Ord a) => CNFFormula a -> m [DepAssignment a]
 solveCNF formula = solveCNF' Map.empty formula
  where
