@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE RankNTypes #-}
 
@@ -48,7 +49,7 @@ import           Database.Persist.Sql(SqlPersistT)
 import           Network.URI(URI(..), URIAuth(..), nullURI, parseURI, relativeTo)
 import           System.FilePath((</>), makeRelative, normalise, takeDirectory, takeFileName)
 import           System.Posix.Files(blockSpecialMode, characterSpecialMode, directoryMode, namedPipeMode, regularFileMode, symbolicLinkMode)
-import           Text.Regex.PCRE((=~))
+import           Text.Regex.PCRE.Heavy((=~), re)
 
 import BDCS.Build.NPM(rebuildNPM)
 import BDCS.DB
@@ -243,7 +244,7 @@ loadIntoMDDB PackageJSON{..} files = do
     addManDir sourceId manDir = let
         manPrefix = normalise (T.unpack manDir)
         paths = map (makeRelative "/" . T.unpack . filesPath) files
-        manFiles = filter (\p -> (manPrefix `isPrefixOf` p) && (p =~ ("\\.[0-9]$" :: String))) paths
+        manFiles = filter (\p -> (manPrefix `isPrefixOf` p) && (p =~ [re|\.[0-9]$|])) paths
      in
         mapM_ (\p -> insertSourceKeyValue (TextKey "man") (T.pack p) Nothing sourceId) manFiles
 

@@ -7,9 +7,11 @@
 import           Control.Conditional(unlessM)
 import           Control.Exception(Handler(..), catches, throw)
 import           Control.Monad(forM_)
-import           Control.Monad.Except(runExceptT)
+import           Control.Monad.Except(ExceptT(..), runExceptT)
+import           Control.Monad.IO.Class(liftIO)
 import           Data.Aeson((.=), ToJSON, object, toJSON)
 import           Data.Aeson.Encode.Pretty(encodePretty)
+import qualified Data.ByteString.Char8 as C8
 import           Data.ByteString.Lazy(toStrict)
 import           Data.Conduit((.|), runConduit)
 import qualified Data.Conduit.List as CL
@@ -23,7 +25,7 @@ import           System.Directory(doesFileExist)
 import           System.Environment(getArgs)
 import           System.Exit(exitFailure)
 import           Text.Printf(printf)
-import           Text.Regex.PCRE((=~))
+import           Text.Regex.PCRE.Heavy((=~), compileM)
 
 import BDCS.DB(Files(..), KeyVal(..), checkAndRunSqlite)
 import BDCS.Files(filesC, getKeyValuesForFile)
@@ -113,17 +115,19 @@ keyValToLabel KeyVal {keyValKey_value=LabelKey x} = Just x
 keyValToLabel _                                   = Nothing
 
 runCommand :: T.Text -> [String] -> IO (Either String ())
-runCommand db args = do
+runCommand db args = runExceptT $ do
     (opts, _) <- compilerOpts options defaultLsOptions args "ls"
 
     printer <- if | lsJSONOutput opts -> return $ liftedPutStrLn . jsonPrinter
-                  | lsVerbose opts -> do currentYear <- formatTime defaultTimeLocale "%Y" <$> getCurrentTime
+                  | lsVerbose opts -> do currentYear <- liftIO $ formatTime defaultTimeLocale "%Y" <$> getCurrentTime
                                          return $ liftedPutStrLn . verbosePrinter currentYear
                   | otherwise -> return $ liftedPutStrLn . simplePrinter
 
-    runExceptT $ checkAndRunSqlite db $ runConduit $
+    regex <- ExceptT $ return $ compileM (C8.pack $ lsMatches opts) []
+
+    checkAndRunSqlite db $ runConduit $
         -- Grab all the Files, filtering out any whose path does not match what we want.
-        filesC .| CL.filter (\f -> T.unpack (filesPath f) =~ lsMatches opts)
+        filesC .| CL.filter (\f -> T.unpack (filesPath f) =~ regex)
         -- Convert them into LsRow records containing only the Files record.
                .| CL.map    initRow
         -- If we were asked for verbose output, add that to the LsRow.

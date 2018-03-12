@@ -4,9 +4,10 @@
 
 import           Control.Conditional(unlessM)
 import           Control.Exception(Handler(..), catches, throw)
-import           Control.Monad.Except(runExceptT)
+import           Control.Monad.Except(ExceptT(..), runExceptT)
 import           Data.Aeson((.=), ToJSON, object, toJSON)
 import           Data.Aeson.Encode.Pretty(encodePretty)
+import qualified Data.ByteString.Char8 as C8
 import           Data.ByteString.Lazy(toStrict)
 import qualified Data.Text as T
 import           Data.Text.Encoding(decodeUtf8)
@@ -18,7 +19,7 @@ import           System.Directory(doesFileExist)
 import           System.Environment(getArgs)
 import           System.Exit(exitFailure)
 import           Text.Printf(printf)
-import           Text.Regex.PCRE((=~))
+import           Text.Regex.PCRE.Heavy((=~), compileM)
 
 import BDCS.DB(Groups(..), KeyVal(..), checkAndRunSqlite)
 import BDCS.GroupKeyValue(getKeyValuesForGroup)
@@ -59,13 +60,14 @@ initRow (key, name) = GroupsRow { rowId=key,
                                   rowName=name }
 
 runCommand :: T.Text -> FilePath -> [String] -> IO (Either String ())
-runCommand db _ args = do
+runCommand db _ args = runExceptT $ do
     (opts, _) <- compilerOpts options defaultGroupsOptions args "groups"
     let printer = if grpJSONOutput opts then jsonPrinter else textPrinter
+    regex <- ExceptT $ return $ compileM (C8.pack $ grpMatches opts) []
 
-    runExceptT $ checkAndRunSqlite db $ runConduit $
+    checkAndRunSqlite db $ runConduit $
         -- Grab all the Groups, filtering out any whose name does not match what we want.
-        groupsC .| CL.filter (\(_, n) -> T.unpack n =~ grpMatches opts)
+        groupsC .| CL.filter (\(_, n) -> T.unpack n =~ regex)
         -- Convert them into GroupsRow records.
                 .| CL.map    initRow
         -- If we were asked for keyval output, add that to the GroupsRow.

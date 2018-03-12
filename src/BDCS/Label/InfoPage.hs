@@ -14,6 +14,7 @@
 -- License along with this library; if not, see <http://www.gnu.org/licenses/>.
 
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 module BDCS.Label.InfoPage(matches,
                            mkLabel)
@@ -21,7 +22,7 @@ module BDCS.Label.InfoPage(matches,
 
 import           Data.List(isPrefixOf, isSuffixOf)
 import qualified Data.Text as T
-import           Text.Regex.PCRE((=~))
+import           Text.Regex.PCRE.Heavy((=~), re)
 
 import BDCS.DB(Files(..))
 import BDCS.Label.Types(Label(..))
@@ -31,7 +32,7 @@ matches Files{..} = let
     filesPath' = T.unpack filesPath
  in
     "/usr/share/info/" `isPrefixOf` filesPath' &&
-    (".info.gz" `isSuffixOf` filesPath' || filesPath' =~ "\\.info-[0-9]+\\.gz")
+    (".info.gz" `isSuffixOf` filesPath' || filesPath' =~ [re|\.info-[0-9]+\.gz|])
 
 mkLabel :: Files -> Maybe Label
 mkLabel _ = Just InfoPageLabel
