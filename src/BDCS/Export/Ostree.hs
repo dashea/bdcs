@@ -56,7 +56,7 @@ import           Paths_bdcs(getDataFileName)
 -- required to make the destination a valid ostree repo is also done by this function - setting up
 -- symlinks and directories, pruning unneeded directories, installing an initrd, building an
 -- RPM database, and so forth.
-ostreeSink :: (MonadError String m, MonadIO m, MonadResource m) => FilePath -> Consumer (Files, CS.Object) m ()
+ostreeSink :: (MonadError String m, MonadResource m) => FilePath -> Consumer (Files, CS.Object) m ()
 ostreeSink outPath = do
     -- While it's possible to copy objects from one OstreeRepo to another, we can't create our own objects, meaning
     -- we can't add the dirtree objects we would need to tie all of the files together. So to export to a new
